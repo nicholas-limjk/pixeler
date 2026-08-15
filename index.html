@@ -1,0 +1,518 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>128×128 Video Pixeler</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0b0b0b; color: #f4f4f4; }
+    main { width: min(92vw, 680px); padding: 32px; border: 1px solid #333; background: #151515; box-shadow: 12px 12px 0 #000; }
+    h1 { margin: 0 0 8px; font-size: clamp(22px, 5vw, 38px); letter-spacing: -2px; }
+    p { color: #aaa; line-height: 1.5; }
+    .drop { display: block; margin: 24px 0; padding: 24px; border: 2px dashed #555; text-align: center; cursor: pointer; }
+    .drop:hover, .drop.drag { border-color: #fff; background: #202020; }
+    input[type=file] { display: none; }
+    .workspace { display: none; grid-template-columns: 1fr 180px; gap: 24px; align-items: start; }
+    canvas { width: 100%; aspect-ratio: 1; background: #000; image-rendering: pixelated; border: 1px solid #444; }
+    #comparison { display: none; }
+    label { display: block; margin-bottom: 18px; font-size: 13px; }
+    input[type=range] { width: 100%; margin-top: 8px; accent-color: white; }
+    button { width: 100%; padding: 12px; border: 0; background: #fff; color: #000; font: 700 14px inherit; cursor: pointer; }
+    button:disabled { opacity: .4; cursor: wait; }
+    #status { min-height: 42px; font-size: 12px; color: #aaa; }
+    video { display: none; }
+    @media (max-width: 560px) { main { padding: 20px; } .workspace { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>128×128 PIXELER</h1>
+    <p>Turn a short video or animated GIF into 16,384 pure black-or-white cells.</p>
+    <label class="drop" id="drop">Choose a video, or select/drop 1–4 GIFs<input id="file" type="file" accept="video/*,image/gif" multiple></label>
+    <button id="sample" style="margin: -10px 0 24px">TRY SAMPLE FLOWER VIDEO</button>
+    <section class="workspace" id="workspace">
+      <canvas id="output" width="128" height="128"></canvas>
+      <div>
+        <label>Threshold: <output id="thresholdValue">128</output>
+          <input id="threshold" type="range" min="0" max="255" value="128">
+        </label>
+        <label><input id="autoThreshold" type="checkbox" checked> Auto threshold for best fidelity</label>
+        <label>Shape density: <output id="densityValue">30</output>%
+          <input id="density" type="range" min="10" max="55" value="30">
+        </label>
+        <label><input id="autoDensity" type="checkbox" checked> Auto-tune shape density</label>
+        <label>Frame rate: <output id="fpsValue">12</output> fps
+          <input id="fps" type="range" min="6" max="24" value="12">
+        </label>
+        <label>Video guidance: <output id="guidanceValue">28</output>%
+          <input id="guidance" type="range" min="0" max="100" value="28">
+        </label>
+        <label><input id="wrap" type="checkbox" checked> Wrap grid edges</label>
+        <button id="convert">EXPORT WEBM</button>
+        <button id="compare" style="margin-top: 8px">EXPORT 4-WAY COMPARISON</button>
+        <p id="status">Previewing up to 10 seconds.</p>
+      </div>
+    </section>
+    <video id="source" muted playsinline></video>
+    <canvas id="comparison" width="256" height="256"></canvas>
+  </main>
+  <script>
+    const GRID_SIZE = 128;
+    const CELL_COUNT = GRID_SIZE * GRID_SIZE;
+    const OUTPUT_DURATION = 10;
+    const fileInput = document.querySelector('#file');
+    const sample = document.querySelector('#sample');
+    const drop = document.querySelector('#drop');
+    const video = document.querySelector('#source');
+    const canvas = document.querySelector('#output');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const comparison = document.querySelector('#comparison');
+    const comparisonCtx = comparison.getContext('2d');
+    const threshold = document.querySelector('#threshold');
+    const autoThreshold = document.querySelector('#autoThreshold');
+    const density = document.querySelector('#density');
+    const autoDensity = document.querySelector('#autoDensity');
+    const fps = document.querySelector('#fps');
+    const guidance = document.querySelector('#guidance');
+    const wrap = document.querySelector('#wrap');
+    const convert = document.querySelector('#convert');
+    const compare = document.querySelector('#compare');
+    const status = document.querySelector('#status');
+    let objectUrl = null;
+    let previewId = 0;
+    let cells = null;
+    let lastFrameNumber = -1;
+    let sourceType = null;
+    let gifStartedAt = 0;
+    let gifFrames = [];
+    let gifFrameEnds = [];
+    let gifDuration = 0;
+    let adaptiveThreshold = null;
+    let adaptiveDensity = null;
+    let lastTarget = null;
+
+    const showValues = () => {
+      document.querySelector('#thresholdValue').value = threshold.value;
+      document.querySelector('#densityValue').value = density.value;
+      document.querySelector('#fpsValue').value = fps.value;
+      document.querySelector('#guidanceValue').value = guidance.value;
+    };
+
+    function lifeStep(source) {
+      const next = new Uint8Array(CELL_COUNT);
+      const wraps = wrap.checked;
+      for (let y = 0; y < GRID_SIZE; y++) {
+        for (let x = 0; x < GRID_SIZE; x++) {
+          let neighbours = 0;
+          for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+              if (dx === 0 && dy === 0) continue;
+              let nx = x + dx, ny = y + dy;
+              if (wraps) { nx = (nx + GRID_SIZE) % GRID_SIZE; ny = (ny + GRID_SIZE) % GRID_SIZE; }
+              if (nx >= 0 && nx < GRID_SIZE && ny >= 0 && ny < GRID_SIZE) neighbours += source[ny * GRID_SIZE + nx];
+            }
+          }
+          const alive = source[y * GRID_SIZE + x];
+          next[y * GRID_SIZE + x] = neighbours === 3 || (alive && neighbours === 2) ? 1 : 0;
+        }
+      }
+      return next;
+    }
+
+    function shapeAwareMask(data) {
+      const lightness = new Float32Array(CELL_COUNT);
+      for (let i = 0; i < data.length; i += 4) {
+        lightness[i / 4] = .2126 * data[i] + .7152 * data[i + 1] + .0722 * data[i + 2];
+      }
+
+      const scores = new Uint16Array(CELL_COUNT);
+      const histogram = new Uint32Array(512);
+      let totalEdge = 0;
+      for (let y = 0; y < GRID_SIZE; y++) {
+        for (let x = 0; x < GRID_SIZE; x++) {
+          const index = y * GRID_SIZE + x;
+          const center = lightness[index];
+          const left = lightness[y * GRID_SIZE + Math.max(0, x - 1)];
+          const right = lightness[y * GRID_SIZE + Math.min(GRID_SIZE - 1, x + 1)];
+          const up = lightness[Math.max(0, y - 1) * GRID_SIZE + x];
+          const down = lightness[Math.min(GRID_SIZE - 1, y + 1) * GRID_SIZE + x];
+          const edge = (Math.abs(right - left) + Math.abs(down - up)) * .75;
+          totalEdge += edge;
+          const orderedTexture = (x * 13 + y * 7) % 17;
+          const score = Math.min(511, Math.round(center + edge + orderedTexture));
+          scores[index] = score;
+          histogram[score]++;
+        }
+      }
+
+      if (autoDensity.checked) {
+        const edgeMean = totalEdge / CELL_COUNT;
+        const suggested = Math.max(20, Math.min(38, 36 - edgeMean * .12));
+        adaptiveDensity = adaptiveDensity === null ? suggested : adaptiveDensity * .8 + suggested * .2;
+        density.value = Math.round(adaptiveDensity);
+        document.querySelector('#densityValue').value = density.value;
+      }
+      const wanted = Math.round(CELL_COUNT * (autoDensity.checked ? adaptiveDensity : Number(density.value)) / 100);
+      let accumulated = 0;
+      let cutoff = 255;
+      for (let score = 511; score >= 0; score--) {
+        accumulated += histogram[score];
+        if (accumulated >= wanted) {
+          cutoff = score;
+          break;
+        }
+      }
+      return { scores, cutoff };
+    }
+
+    function sourceTime() {
+      return sourceType === 'gif' ? (performance.now() - gifStartedAt) / 1000 : video.currentTime;
+    }
+
+    function currentGifFrame() {
+      if (!gifFrames.length || !gifDuration) return null;
+      const timelineTime = Math.min(sourceTime() / OUTPUT_DURATION, .999999) * gifDuration;
+      const index = gifFrameEnds.findIndex(end => timelineTime < end);
+      return gifFrames[index < 0 ? gifFrames.length - 1 : index];
+    }
+
+    function pixelate(force = false) {
+      const media = sourceType === 'gif' ? currentGifFrame() : video;
+      const ready = sourceType === 'gif' ? media : video.videoWidth;
+      if (!ready) return false;
+      const frameNumber = Math.floor(sourceTime() * Number(fps.value));
+      if (!force && frameNumber === lastFrameNumber) return false;
+      lastFrameNumber = frameNumber;
+      ctx.drawImage(media, 0, 0, GRID_SIZE, GRID_SIZE);
+      const frame = ctx.getImageData(0, 0, GRID_SIZE, GRID_SIZE);
+      const target = new Uint8Array(CELL_COUNT);
+      if (autoThreshold.checked) {
+        const shaped = shapeAwareMask(frame.data);
+        adaptiveThreshold = adaptiveThreshold === null ? shaped.cutoff : adaptiveThreshold * .65 + shaped.cutoff * .35;
+        document.querySelector('#thresholdValue').value = `auto ${Math.round(adaptiveThreshold)}`;
+        for (let i = 0; i < CELL_COUNT; i++) target[i] = shaped.scores[i] >= adaptiveThreshold ? 1 : 0;
+      } else {
+        const limit = Number(threshold.value);
+        for (let i = 0; i < frame.data.length; i += 4) {
+          const lightness = .2126 * frame.data[i] + .7152 * frame.data[i + 1] + .0722 * frame.data[i + 2];
+          target[i / 4] = lightness >= limit ? 1 : 0;
+        }
+      }
+      lastTarget = target;
+
+      if (!cells) {
+        cells = target;
+      } else {
+        cells = lifeStep(cells);
+        const pull = Number(guidance.value) / 100;
+        for (let i = 0; i < CELL_COUNT; i++) {
+          if (cells[i] !== target[i] && Math.random() < pull) cells[i] = target[i];
+        }
+      }
+
+      for (let i = 0; i < frame.data.length; i += 4) {
+        const value = cells[i / 4] ? 255 : 0;
+        frame.data[i] = frame.data[i + 1] = frame.data[i + 2] = value;
+        frame.data[i + 3] = 255;
+      }
+      ctx.putImageData(frame, 0, 0);
+      return true;
+    }
+
+    function preview() {
+      pixelate();
+      if (sourceType === 'gif') {
+        if (sourceTime() >= OUTPUT_DURATION) resetGif().then(preview);
+        else previewId = requestAnimationFrame(preview);
+      } else if (!video.paused && video.currentTime < Math.min(video.duration, OUTPUT_DURATION)) {
+        previewId = requestAnimationFrame(preview);
+      } else if (video.currentTime >= Math.min(video.duration, OUTPUT_DURATION)) {
+        video.currentTime = 0;
+        video.play();
+        previewId = requestAnimationFrame(preview);
+      }
+    }
+
+    function resetGif() {
+      gifStartedAt = performance.now();
+      cells = null;
+      lastFrameNumber = -1;
+      adaptiveThreshold = null;
+      adaptiveDensity = null;
+      return Promise.resolve();
+    }
+
+    async function decodeGifChain(files) {
+      if (!('ImageDecoder' in window)) throw new Error('Animated GIF decoding requires a current Chrome or Edge browser.');
+      gifFrames.forEach(frame => frame.close());
+      gifFrames = [];
+      gifFrameEnds = [];
+      gifDuration = 0;
+      for (const file of files) {
+        const decoder = new ImageDecoder({ data: await file.arrayBuffer(), type: 'image/gif' });
+        await decoder.tracks.ready;
+        const frameCount = decoder.tracks.selectedTrack.frameCount;
+        for (let index = 0; index < frameCount; index++) {
+          const result = await decoder.decode({ frameIndex: index, completeFramesOnly: true });
+          gifFrames.push(await createImageBitmap(result.image));
+          gifDuration += Math.max((result.image.duration || 100000) / 1000000, 0.02);
+          gifFrameEnds.push(gifDuration);
+          result.image.close();
+        }
+        decoder.close();
+      }
+    }
+
+    function isGifFile(file) {
+      return file?.type === 'image/gif' || file?.name.toLowerCase().endsWith('.gif');
+    }
+
+    function loadFiles(fileList) {
+      const files = Array.from(fileList || []);
+      if (!files.length) return;
+      if (files.length > 4) {
+        status.textContent = 'Choose no more than four GIFs.';
+        return;
+      }
+      if (files.length > 1 && files.some(file => !isGifFile(file))) {
+        status.textContent = 'Chaining supports GIF files only. Choose one video or up to four GIFs.';
+        return;
+      }
+      loadFile(files[0], files);
+    }
+
+    function loadFile(file, files = [file]) {
+      const isGif = file?.type === 'image/gif' || file?.name.toLowerCase().endsWith('.gif');
+      if (!file || (!file.type.startsWith('video/') && !isGif)) { status.textContent = 'Please choose a video or animated GIF.'; return; }
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      objectUrl = isGif ? null : URL.createObjectURL(file);
+      cancelAnimationFrame(previewId);
+      if (isGif) {
+        sourceType = 'gif';
+        video.pause();
+        video.removeAttribute('src');
+        status.textContent = `Decoding ${files.length} GIF${files.length > 1 ? 's' : ''}…`;
+        decodeGifChain(files).then(resetGif).then(() => {
+          document.querySelector('#workspace').style.display = 'grid';
+          status.textContent = `${files.length}-GIF chain ready: ${gifFrames.length} frames, ${gifDuration.toFixed(1)}s loop.`;
+          preview();
+        }).catch(error => {
+          status.textContent = error.message || 'This GIF could not be decoded.';
+        });
+        return;
+      }
+      sourceType = 'video';
+      video.src = objectUrl;
+      video.onloadedmetadata = () => {
+        cells = null;
+        lastFrameNumber = -1;
+        adaptiveThreshold = null;
+        adaptiveDensity = null;
+        document.querySelector('#workspace').style.display = 'grid';
+        status.textContent = video.duration > OUTPUT_DURATION ? `Using the first ${OUTPUT_DURATION} seconds of ${video.duration.toFixed(1)}s.` : `Ready: ${video.duration.toFixed(1)} seconds.`;
+        video.currentTime = 0;
+        video.play();
+        cancelAnimationFrame(previewId);
+        preview();
+      };
+    }
+
+    function loadSample() {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+      objectUrl = null;
+      sourceType = 'video';
+      video.src = new URL('sample-flower.mp4', location.href).href;
+      video.onloadedmetadata = () => {
+        cells = null;
+        lastFrameNumber = -1;
+        adaptiveThreshold = null;
+        adaptiveDensity = null;
+        document.querySelector('#workspace').style.display = 'grid';
+        status.textContent = `Sample ready: using the first ${Math.min(video.duration, OUTPUT_DURATION).toFixed(1)} seconds.`;
+        video.currentTime = 0;
+        video.play();
+        cancelAnimationFrame(previewId);
+        preview();
+      };
+    }
+
+    fileInput.addEventListener('change', () => loadFiles(fileInput.files));
+    sample.addEventListener('click', loadSample);
+    drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('drag'); });
+    drop.addEventListener('dragleave', () => drop.classList.remove('drag'));
+    drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('drag'); loadFiles(e.dataTransfer.files); });
+    threshold.addEventListener('input', () => { showValues(); cells = null; pixelate(true); });
+    autoThreshold.addEventListener('change', () => {
+      threshold.disabled = autoThreshold.checked;
+      adaptiveThreshold = null;
+      cells = null;
+      lastFrameNumber = -1;
+      pixelate(true);
+    });
+    density.addEventListener('input', () => {
+      showValues();
+      adaptiveThreshold = null;
+      cells = null;
+      lastFrameNumber = -1;
+      pixelate(true);
+    });
+    autoDensity.addEventListener('change', () => {
+      density.disabled = autoDensity.checked;
+      adaptiveDensity = null;
+      adaptiveThreshold = null;
+      cells = null;
+      lastFrameNumber = -1;
+      pixelate(true);
+    });
+    fps.addEventListener('input', () => { showValues(); lastFrameNumber = -1; });
+    guidance.addEventListener('input', showValues);
+    wrap.addEventListener('change', () => { cells = null; lastFrameNumber = -1; });
+
+    convert.addEventListener('click', async () => {
+      if (!sourceType || !window.MediaRecorder) return;
+      convert.disabled = true;
+      cancelAnimationFrame(previewId);
+      cells = null;
+      lastFrameNumber = -1;
+      adaptiveThreshold = null;
+      adaptiveDensity = null;
+      if (sourceType === 'gif') {
+        await resetGif();
+      } else if (video.currentTime > 0.01) {
+        video.pause();
+        const rewound = new Promise(resolve => video.addEventListener('seeked', resolve, { once: true }));
+        video.currentTime = 0;
+        await rewound;
+      } else {
+        video.pause();
+        video.currentTime = 0;
+      }
+      const frameRate = Number(fps.value);
+      const stream = canvas.captureStream(frameRate);
+      const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm';
+      const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 150000 });
+      const chunks = [];
+      recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+      const finished = new Promise(resolve => recorder.onstop = resolve);
+      recorder.start();
+      if (sourceType === 'video') await video.play();
+      const duration = sourceType === 'gif' ? OUTPUT_DURATION : Math.min(video.duration, OUTPUT_DURATION);
+      await new Promise(resolve => {
+        const render = () => {
+          pixelate();
+          const elapsed = sourceTime();
+          status.textContent = `Converting ${Math.min(elapsed, duration).toFixed(1)} / ${duration.toFixed(1)}s…`;
+          if (elapsed >= duration || (sourceType === 'video' && video.ended)) resolve();
+          else requestAnimationFrame(render);
+        };
+        render();
+      });
+      if (sourceType === 'video') video.pause();
+      recorder.stop();
+      await finished;
+      const url = URL.createObjectURL(new Blob(chunks, { type: 'video/webm' }));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'life-video-128x128.webm';
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      status.textContent = 'Done — exported as a 128×128 Game of Life WebM.';
+      convert.disabled = false;
+      if (sourceType === 'gif') resetGif().then(preview);
+      else { video.currentTime = 0; video.play(); preview(); }
+    });
+
+    function drawComparison(states, values) {
+      for (let panel = 0; panel < values.length; panel++) {
+        if (!states[panel]) {
+          states[panel] = lastTarget.slice();
+        } else {
+          states[panel] = lifeStep(states[panel]);
+          const pull = values[panel] / 100;
+          for (let i = 0; i < CELL_COUNT; i++) {
+            if (states[panel][i] !== lastTarget[i] && Math.random() < pull) states[panel][i] = lastTarget[i];
+          }
+        }
+        const image = comparisonCtx.createImageData(GRID_SIZE, GRID_SIZE);
+        for (let i = 0; i < CELL_COUNT; i++) {
+          const value = states[panel][i] ? 255 : 0;
+          const offset = i * 4;
+          image.data[offset] = image.data[offset + 1] = image.data[offset + 2] = value;
+          image.data[offset + 3] = 255;
+        }
+        const x = (panel % 2) * GRID_SIZE;
+        const y = Math.floor(panel / 2) * GRID_SIZE;
+        comparisonCtx.putImageData(image, x, y);
+        comparisonCtx.fillStyle = 'black';
+        comparisonCtx.fillRect(x + 3, y + 3, 36, 14);
+        comparisonCtx.fillStyle = 'white';
+        comparisonCtx.font = '10px monospace';
+        comparisonCtx.fillText(`${values[panel]}%`, x + 7, y + 13);
+      }
+    }
+
+    compare.addEventListener('click', async () => {
+      if (!sourceType || !window.MediaRecorder) return;
+      compare.disabled = convert.disabled = true;
+      cancelAnimationFrame(previewId);
+      cells = null;
+      lastTarget = null;
+      lastFrameNumber = -1;
+      adaptiveThreshold = null;
+      adaptiveDensity = null;
+      if (sourceType === 'gif') {
+        await resetGif();
+      } else {
+        video.pause();
+        if (video.currentTime > .01) {
+          const rewound = new Promise(resolve => video.addEventListener('seeked', resolve, { once: true }));
+          video.currentTime = 0;
+          await rewound;
+        }
+      }
+
+      const stream = comparison.captureStream(Number(fps.value));
+      const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm';
+      const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 600000 });
+      const chunks = [];
+      recorder.ondataavailable = event => { if (event.data.size) chunks.push(event.data); };
+      const finished = new Promise(resolve => recorder.onstop = resolve);
+      const values = [0, 25, 75, 100];
+      const states = [null, null, null, null];
+      recorder.start();
+      if (sourceType === 'video') await video.play();
+      const duration = sourceType === 'gif' ? OUTPUT_DURATION : Math.min(video.duration, OUTPUT_DURATION);
+      await new Promise(resolve => {
+        const render = () => {
+          const updated = pixelate();
+          if (updated && lastTarget) drawComparison(states, values);
+          const elapsed = sourceTime();
+          status.textContent = `Recording comparison ${Math.min(elapsed, duration).toFixed(1)} / ${duration.toFixed(1)}s…`;
+          if (elapsed >= duration || (sourceType === 'video' && video.ended)) resolve();
+          else requestAnimationFrame(render);
+        };
+        render();
+      });
+      if (sourceType === 'video') video.pause();
+      recorder.stop();
+      await finished;
+      const url = URL.createObjectURL(new Blob(chunks, { type: 'video/webm' }));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'life-guidance-comparison-0-25-75-100.webm';
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      status.textContent = 'Done — exported the 0%, 25%, 75%, and 100% comparison.';
+      compare.disabled = convert.disabled = false;
+      if (sourceType === 'gif') resetGif().then(preview);
+      else { video.currentTime = 0; video.play(); preview(); }
+    });
+
+    showValues();
+    threshold.disabled = autoThreshold.checked;
+    density.disabled = autoDensity.checked;
+  </script>
+</body>
+</html>
