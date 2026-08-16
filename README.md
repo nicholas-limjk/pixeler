@@ -1,19 +1,44 @@
 # 128×128 Video Pixeler
 
-A dependency-free browser tool that converts up to 10 seconds of a video or animated GIF chain into a true 128×128, black-and-white WebM using a media-guided Conway's Game of Life simulation.
+Turn a short video or GIF sequence into a crisp 128×128 black-and-white cellular animation in the browser.
 
-## Run
+![Example pixel animation](sample-test.gif)
 
-Open `index.html` in Chrome or Edge, choose a video or one to four GIFs, adjust the controls, and click **Export WebM**. Multiple GIFs are chained in selection order, then time-fitted so the complete chain appears within the 10-second export.
+Pixeler combines each source frame with Conway's Game of Life. The result contains exactly 16,384 binary cells per frame and exports as a WebM of up to ten seconds.
 
-The complete GIF chain is time-fitted into the 10-second output, so later GIFs are not cut off. **Export 4-Way Comparison** creates a synchronized 2×2 video showing guidance values of 0%, 25%, 75%, and 100%.
+## Try it
 
-Use **Try Sample Flower Video** to test with the included public-domain MDN flower clip.
+Open `index.html` in Chrome or Edge—there is no build step and no server dependency.
 
-Each output frame advances Conway's Game of Life by one generation. The **Video guidance** control sets the probability that a cell which differs from the source video will be pulled back toward it. At 0% the video is only the initial seed; at 100% the output follows the thresholded video exactly.
+1. Choose a video or up to four animated GIFs.
+2. Adjust guidance, threshold, and shape density.
+3. Preview the simulation.
+4. Export a WebM or a synchronized four-way comparison.
 
-**Auto threshold** is enabled by default. It combines brightness with local edge contrast, preserving outlines and internal features instead of producing flat silhouettes. **Shape density** controls the percentage of cells the algorithm aims to keep alive; 25–35% usually creates the most interesting Life patterns. Disable auto threshold to use the brightness slider manually.
+The repository includes a [sample flower video](sample-flower.mp4), an [example GIF](sample-test.gif), and a [generated WebM](simple-video.mp4).
 
-**Auto-tune shape density** measures edge complexity on every frame. Simple frames receive a denser cell seed so they remain active; highly detailed frames receive a sparser seed to avoid collapsing into visual noise. The value is smoothed over time to prevent flicker.
+## How it works
 
-The output contains exactly 16,384 cells per frame. The enlarged preview uses nearest-neighbor rendering so each cell stays sharp.
+```mermaid
+flowchart LR
+    M["Video or GIF frames"] --> T["Brightness + edge threshold"]
+    T --> S["128×128 cell seed"]
+    S --> L["Conway's Game of Life step"]
+    M --> G["Media guidance"]
+    G --> L
+    L --> W["WebM export"]
+```
+
+- **Video guidance** controls how strongly each generation is pulled toward the source frame. At 0%, the video supplies only the initial seed; at 100%, output follows the thresholded source.
+- **Auto threshold** combines brightness and local edge contrast to preserve outlines and internal detail.
+- **Shape density** targets the percentage of live cells; 25–35% usually produces lively patterns.
+- **Auto-tune density** adapts to frame complexity and smooths changes to reduce flicker.
+- Multiple GIFs are chained in order and time-fitted into the ten-second output.
+
+## Why this project
+
+The tool explores a useful middle ground between literal pixelation and autonomous cellular art: the source remains recognizable, but every frame is also a valid Life generation.
+
+## Implementation
+
+The application is dependency-free HTML and JavaScript. Rendering and export happen locally in the browser using canvas and browser media APIs.
